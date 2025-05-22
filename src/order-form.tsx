@@ -12,6 +12,28 @@ import React, { useEffect, useState, useRef } from "react";
 import axios from "axios";
 import { useSearchParams } from 'react-router-dom'; 
 
+const globalStyleMap: Record<string, any> = {};
+
+function applyWholesaleDiscountIfNeeded(map: Record<string, any>, customerId: string) {
+  if (customerId === "NZ1008") {
+    Object.keys(map).forEach(key => {
+      const item = map[key];
+      if (item?.Wholesale && !item._discounted) {
+        item.Wholesale = (parseFloat(item.Wholesale) * 0.8).toFixed(2);
+        item._discounted = true;
+      }
+    });
+    Object.keys(globalStyleMap).forEach(key => {
+      const item = globalStyleMap[key];
+      if (item?.Wholesale && !item._discounted) {
+        item.Wholesale = (parseFloat(item.Wholesale) * 0.8).toFixed(2);
+        item._discounted = true;
+      }
+    });
+  }
+}
+
+
 function expandSizes(sizeRange: string, style?: string): string[] {
   const fixedSizes = ["ONE", "OS"];
   if (fixedSizes.includes(sizeRange)) return ["ONE"];
@@ -87,7 +109,7 @@ function App() {
   
 
 const searchParams = new URLSearchParams(window.location.search);
-const initialSheet = searchParams.get("sheet") || "TerraWS"; // 替换为初始的 sheet 名字
+const initialSheet = searchParams.get("sheet") || "TerraWS";
 const [sheetName, setSheetName] = useState(initialSheet);
 
 const sheetOptions = ["TerraWS"]; // 替换为你实际的 sheet 名字列表
@@ -95,7 +117,9 @@ const sheetOptions = ["TerraWS"]; // 替换为你实际的 sheet 名字列表
   const [data, setData] = useState<any[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [customerId, setCustomerId] = useState("");
+  const [customerName, setCustomerName] = useState("");
   const [email, setEmail] = useState("");
+  const [sendCopyToCapezio, setSendCopyToCapezio] = useState(true);
   const [quantities, setQuantities] = useState<Record<string, number>>({});
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [styleMap, setStyleMap] = useState<Record<string, any>>({});
@@ -105,11 +129,31 @@ useEffect(() => {
     .then(res => {
       setData(res.data);
 
-      const map: Record<string, any> = {};
-      res.data.forEach(i => {
-        if (i.Style) map[i.Style] = i;
-      });
-      setStyleMap(map);
+const map: Record<string, any> = {};
+let currentCollectionGroup: string | null = null;
+
+res.data.forEach(i => {
+  // 如果是 Collection 分组标题行（其余字段都为空）
+  if (i.Collection && !i.Style && !i.Desc) {
+    currentCollectionGroup = i.Collection;
+  }
+
+// 如果是正常产品行
+  if (i.Style) {
+    map[i.Style] = {
+      ...i,
+      Group: currentCollectionGroup, // ✅ 当前 sheet 内使用
+    };
+    globalStyleMap[i.Style] = {
+      ...i,
+      Group: currentCollectionGroup, // ✅ 所有 sheet 累积缓存
+    };
+  }
+});
+
+applyWholesaleDiscountIfNeeded(map, customerId);
+setStyleMap(map);
+
 
       const expanded: Record<string, boolean> = {};
       let currentGroup: string | null = null;
@@ -127,6 +171,25 @@ useEffect(() => {
     });
 }, [sheetName]);
 
+useEffect(() => {
+  // 如果 customerId 为空，就不处理
+  if (!customerId || Object.keys(globalStyleMap).length === 0) return;
+
+  // 重新构建 styleMap（从 globalStyleMap 拉出符合当前 sheet 的产品）
+  const updatedMap: Record<string, any> = {};
+  Object.keys(globalStyleMap).forEach(styleCode => {
+    const item = globalStyleMap[styleCode];
+    if (item?.Group && item.Group !== undefined) {
+      updatedMap[styleCode] = { ...item };
+    }
+  });
+
+  // 应用折扣逻辑
+  applyWholesaleDiscountIfNeeded(updatedMap, customerId);
+  setStyleMap(updatedMap);
+}, [customerId]);
+
+
 const sendEmail = async () => {
   const hasOrder = Object.values(quantities).some(qty => qty > 0);
   if (!hasOrder) {
@@ -137,21 +200,49 @@ const sendEmail = async () => {
     alert("Please enter an email address.");
     return;
   }
+   if (!customerId && !customerName) {
+    alert("Please enter Customer ID or Customer Name (at least one required).");
+    return;
+  }
 
   // 生成 CSV 内容
-  const rows = Object.entries(quantities)
-    .filter(([_, v]) => v > 0)
-    .map(([sku, qty]) => `${sku},${qty}`);
-  const csvContent = `SKU,Qty\r\n${rows.join("\r\n")}`;
+const csvContent = generateGroupedCSV(quantities, globalStyleMap);
 
   // 生成 HTML 表格
-  let htmlTable = "<table border='1' cellpadding='6' cellspacing='0'><tr><th>SKU</th><th>Qty</th></tr>";
-  Object.entries(quantities).forEach(([sku, qty]) => {
-    if (qty > 0) {
-      htmlTable += `<tr><td>${sku}</td><td>${qty}</td></tr>`;
-    }
-  });
-  htmlTable += "</table>";
+//  let htmlTable = "<table border='1' cellpadding='6' cellspacing='0'><tr><th>SKU</th><th>Qty</th></tr>";
+//  Object.entries(quantities).forEach(([sku, qty]) => {
+//    if (qty > 0) {
+  //    htmlTable += `<tr><td>${sku}</td><td>${qty}</td></tr>`;
+//    }
+//  });
+ // htmlTable += "</table>";
+
+  let htmlTable = "";
+const grouped: Record<string, { rows: string[], subtotal: number, qty: number }> = {};
+
+
+Object.entries(quantities).forEach(([sku, qty]) => {
+  if (qty > 0) {
+    const styleCode = sku.substring(0, 9);
+    const item = globalStyleMap[styleCode];
+    const group = item?.Group || "Uncategorized";
+    const price = parseFloat(item?.Wholesale) || 0;
+
+    if (!grouped[group]) grouped[group] = { rows: [], subtotal: 0 };
+    grouped[group].rows.push(`<tr><td>${sku}</td><td>${qty}</td></tr>`);
+    grouped[group].subtotal += price * qty;
+    grouped[group].qty = (grouped[group].qty || 0) + qty;
+  }
+});
+
+Object.entries(grouped).forEach(([group, { rows, subtotal }]) => {
+  htmlTable += `<h4>${group}</h4>`;
+  htmlTable += "<table border='1' cellpadding='6' cellspacing='0'><tr><th>SKU</th><th>Qty</th></tr>";
+  htmlTable += rows.join("");
+  htmlTable += `<tr><td><b>Subtotal:</b>$${subtotal.toFixed(2)}</td><td><b>${grouped[group].qty}</b></td></tr>`;
+  htmlTable += "</table><br/>";
+});
+
 
   // ✅ 加入下单时间、数量、金额
   const now = new Date();
@@ -163,7 +254,8 @@ const sendEmail = async () => {
     .padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`;
 
   const summaryHtml = `
-    <p><b>Customer ID:</b> ${customerId || "Unnamed Customer"}</p>
+    <p><b>Customer ID:</b> ${customerId || "N/A"}</p>
+    <p><b>Customer Name:</b> ${customerName || "N/A"}</p>
     <p><b>Order Time:</b> ${orderTime}</p>
     <p><b>Total Quantity:</b> ${totalQty}</p>
     <p><b>Total Amount:</b> $${totalAmount.toFixed(2)}</p>
@@ -189,11 +281,16 @@ const sendEmail = async () => {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      to: email,
-      subject: `B2B Order from ${customerId || "Unnamed Customer"}`,
-      htmlContent,
-      csvContent: encodeToBase64(csvContent),
-    }),
+  to: email,
+  subject: `Capezio Terra - V720C Order from ${
+    customerName && customerId
+      ? `${customerName} (${customerId})`
+      : customerName || customerId || "Unnamed Customer"
+  }`,
+  cc: sendCopyToCapezio ? ["sball@capezio.com", "kjones@capezio.com"] : [],
+  htmlContent,
+  csvContent: encodeToBase64(csvContent),
+}),
   });
 
   const result = await res.json();
@@ -217,12 +314,21 @@ const sendEmail = async () => {
     }
   });
 
-  const handleChange = (sku: string, val: string) => {
-    const qty = parseInt(val);
-    if (!isNaN(qty)) {
-      setQuantities(q => ({ ...q, [sku]: qty }));
-    }
-  };
+const handleChange = (sku: string, val: string) => {
+  if (val.trim() === "") {
+    setQuantities(q => {
+      const updated = { ...q };
+      delete updated[sku];
+      return updated;
+    });
+    return;
+  }
+
+  const qty = parseInt(val);
+  if (!isNaN(qty)) {
+    setQuantities(q => ({ ...q, [sku]: qty }));
+  }
+};
 
   const generateSKU = (item: any, width: string, colour: string, size: string): string => {
     const style = item.Style;
@@ -237,31 +343,69 @@ const sendEmail = async () => {
 const fixedSize = (size: string): string => {
   if (size === "ONE" || size === "OS") return "ONE";
 
-  // 去除注释前缀（如 "Tween I" -> "I"）
+  // 去除前缀（如 "Tween I" -> "I"）
   const parts = size.trim().split(" ");
   const rawSize = parts.length > 1 ? parts.slice(-1)[0] : size;
 
-  // 去掉斜杠（如 S/M → SM）并补足3位
+  // 去掉斜杠（如 S/M → SM）并转大写
   const clean = rawSize.replace("/", "").toUpperCase();
-  const num = parseFloat(clean);
 
-  if (!isNaN(num)) {
-    return (num * 10).toFixed(0).padStart(3, "0"); // 数值类型，如 10.5 → 105
+  // 如果是合法数字（整数或小数）
+  if (/^\d+(\.\d+)?$/.test(clean)) {
+    return (parseFloat(clean) * 10).toFixed(0).padStart(3, "0");
   }
 
-  return clean.padStart(3, "0"); // 非数字，如 SM → 0SM, I → 00I
+  // 特别处理如 1X → 01X，2X → 02X
+  if (/^\d+X$/.test(clean)) {
+    const match = clean.match(/^(\d+)X$/);
+    return match ? match[1].padStart(2, "0") + "X" : clean.padStart(3, "0");
+  }
+
+  // 如果是长度3的非数字（如 1X2），保持原样
+  if (clean.length === 3 && !/^\d+(\.\d+)?$/.test(clean)) {
+    return clean;
+  }
+
+  // 默认前补0至3位
+  return clean.padStart(3, "0");
 };
 
+function generateGroupedCSV(quantities: Record<string, number>, styleMap: Record<string, any>) {
+  const grouped: Record<string, { rows: string[], subtotal: number, qty: number }> = {};
+
+  Object.entries(quantities).forEach(([sku, qty]) => {
+    if (qty > 0) {
+      const styleCode = sku.substring(0, 9); // 保持原SKU格式
+      const item = styleMap[styleCode];
+      const group = item?.Group || "Uncategorized";
+      const price = parseFloat(item?.Wholesale) || 0;
+
+      if (!grouped[group]) grouped[group] = { rows: [], subtotal: 0 };
+      grouped[group].rows.push(`${sku},${qty}`);
+      grouped[group].subtotal += price * qty;
+      grouped[group].qty = (grouped[group].qty || 0) + qty;
+    }
+  });
+
+  const lines = ["SKU,Qty"];
+  Object.entries(grouped).forEach(([group, { rows, subtotal }]) => {
+    lines.push(``, `# ${group}`, ...rows, `Subtotal,${grouped[group].qty},${subtotal.toFixed(2)}`);
+  });
+
+  return lines.join("\r\n");
+}
+  
   const downloadCSV = () => {
    const hasOrder = Object.values(quantities).some(qty => qty > 0);
   if (!hasOrder) {
     alert("❌ No items ordered. Please enter quantities before downloading.");
     return;
   }
-    const rows = Object.entries(quantities)
-      .filter(([_, v]) => v > 0)
-      .map(([sku, qty]) => `${sku},${qty}`);
-    const csvContent = `SKU,Qty\n${rows.join("\n")}`;
+    //const rows = Object.entries(quantities)
+    //  .filter(([_, v]) => v > 0)
+   //   .map(([sku, qty]) => `${sku},${qty}`);
+   // const csvContent = `SKU,Qty\n${rows.join("\n")}`;
+    const csvContent = generateGroupedCSV(quantities, globalStyleMap);
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -273,7 +417,7 @@ const fixedSize = (size: string): string => {
   const totalQty = Object.values(quantities).reduce((sum, v) => sum + v, 0);
   const totalAmount = Object.entries(quantities).reduce((sum, [sku, qty]) => {
     const styleCode = sku.substring(0, 9);
-    const item = styleMap[styleCode];
+    const item =  globalStyleMap[styleCode];
     return sum + ((parseFloat(item?.Wholesale) || 0) * qty);
   }, 0);
 
@@ -308,21 +452,11 @@ setTimeout(() => {
   setExpandedGroups(prev => {
     const updated = { ...prev };
     Object.keys(imported).forEach(sku => {
-      const item = data.find(i => {
-        const sizes = expandSizes(i.Size, i.Style);
-        const widths = expandWidths(i.Width);
-        const colours = expandColours(i.Colours);
-        return colours.some(colour =>
-          widths.some(width =>
-            sizes.some(size =>
-              generateSKU(i, width, colour, size) === sku
-            )
-          )
-        );
-      });
-      if (item?.Collection) {
-        updated[item.Collection] = true;
-      }
+   const styleCode = sku.substring(0, 9);
+const item = globalStyleMap[styleCode];
+if (item?.Group) {
+  updated[item.Group] = true;
+}
     });
     return updated;
   });
@@ -361,46 +495,108 @@ setTimeout(() => {
   </select>
 </div>
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <input
-          placeholder="Enter Customer ID"
-          value={customerId}
-          onChange={e => setCustomerId(e.target.value)}
-          onKeyDown={e => { if (e.key === "Enter") e.currentTarget.blur(); }}
-          style={{ padding: 5, fontSize: 16 }}
-        />
-        <div>
-          <input
-  type="email"
-  placeholder="Enter email to send"
-  value={email}
-  onChange={e => setEmail(e.target.value)}
-  style={{ padding: 5, fontSize: 16, marginLeft: 10 }}
-/>
-<button onClick={sendEmail} style={{ padding: 8, fontWeight: "bold", marginLeft: 10 }}>
-  Send to Email
-</button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".csv"
-            onChange={handleImportCSV}
-            style={{ display: "none" }}
-          />
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            style={{ padding: 8, fontWeight: "bold", marginRight: 10 }}
-          >
-            Import CSV
-          </button>
-          <button onClick={downloadCSV} style={{ padding: 8, fontWeight: "bold" }}>
-            Download CSV
-          </button>
-        </div>
-      </div>
+<div
+  style={{
+    display: "flex",
+    flexWrap: "wrap",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 10,
+    marginBottom: 10,
+  }}
+>
+  {/* 左侧：Customer ID 和 Name */}
+  <div
+    style={{
+      display: "flex",
+      flexDirection: "row",
+      flexWrap: "wrap",
+      gap: 10,
+      minWidth: 260,
+      flex: 1,
+    }}
+  >
+    <input
+      placeholder="Enter Customer ID"
+      value={customerId}
+      onChange={e => setCustomerId(e.target.value)}
+      onKeyDown={e => { if (e.key === "Enter") e.currentTarget.blur(); }}
+      style={{ padding: 5, fontSize: 16, minWidth: 120 }}
+    />
+    <input
+      placeholder="Enter Customer Name"
+      value={customerName}
+      onChange={e => setCustomerName(e.target.value)}
+      onKeyDown={e => { if (e.key === "Enter") e.currentTarget.blur(); }}
+      style={{ padding: 5, fontSize: 16, minWidth: 120 }}
+    />
+  </div>
 
-      <p style={{ marginTop: 10 }}>Total Items: <b>{totalQty}</b> — Total Amount: <b>${totalAmount.toFixed(2)}</b></p>
+  {/* 右侧：邮箱、复选框、按钮 */}
+  <div
+    style={{
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "flex-end",
+      gap: 5,
+      minWidth: 220,
+    }}
+  >
+    <label style={{ display: "flex", alignItems: "center", gap: 5 }}>
+      <input
+        type="checkbox"
+        checked={sendCopyToCapezio}
+        onChange={e => setSendCopyToCapezio(e.target.checked)}
+      />
+      Send Copy to Capezio
+    </label>
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        flexWrap: "wrap",
+        justifyContent: "flex-end",
+      }}
+    >
+      <input
+        type="email"
+        placeholder="Enter email to send"
+        value={email}
+        onChange={e => setEmail(e.target.value)}
+        style={{ padding: 5, fontSize: 16, minWidth: 160 }}
+      />
+      <button onClick={sendEmail} style={{ padding: 8, fontWeight: "bold" }}>
+        Send to Email
+      </button>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".csv"
+        onChange={handleImportCSV}
+        style={{ display: "none" }}
+      />
+      <button
+        type="button"
+        onClick={() => fileInputRef.current?.click()}
+        style={{ padding: 8, fontWeight: "bold" }}
+      >
+        Import CSV
+      </button>
+      <button onClick={downloadCSV} style={{ padding: 8, fontWeight: "bold" }}>
+        Download CSV
+      </button>
+    </div>
+  </div>
+</div>
+
+
+{/* 👇 单独写产品汇总信息 */}
+<p style={{ marginTop: 10 }}>
+  Total Items: <b>{totalQty}</b> — Total Amount: <b>${totalAmount.toFixed(2)}</b>
+</p>
+
+
 
       {Object.entries(grouped).map(([group, items], idx) => (
         <div key={group} style={{ marginBottom: 30 }}>
@@ -410,30 +606,32 @@ setTimeout(() => {
 >
   {idx + 1}. {group}
   {" "}
-  {(() => {
-    let qty = 0;
-    let amount = 0;
-    items.forEach((item: any) => {
-      const sizes = expandSizes(item.Size, item.Style);
-      const widths = expandWidths(item.Width);
-      const colours = expandColours(item.Colours);
-      colours.forEach(colour => {
-        widths.forEach(width => {
-          sizes.forEach(size => {
-            const sku = generateSKU(item, width, colour, size);
-            const count = quantities[sku] || 0;
-            qty += count;
-            amount += count * parseFloat(item.Wholesale || "0");
-          });
+{(() => {
+  let qty = 0;
+  let amount = 0;
+  items.forEach((originalItem: any) => {
+    const item = styleMap[originalItem.Style] || originalItem;
+    const sizes = expandSizes(item.Size, item.Style);
+    const widths = expandWidths(item.Width);
+    const colours = expandColours(item.Colours);
+    colours.forEach(colour => {
+      widths.forEach(width => {
+        sizes.forEach(size => {
+          const sku = generateSKU(item, width, colour, size);
+          const count = quantities[sku] || 0;
+          qty += count;
+          amount += count * parseFloat(item.Wholesale || "0");
         });
       });
     });
-    return `(Ordered: ${qty}, $${amount.toFixed(2)})`;
-  })()}
+  });
+  return `(Ordered: ${qty}, $${amount.toFixed(2)})`;
+})()}
 </h2>
 
           {expandedGroups[group] === false ? null : (
-            items.map(item => {
+            items.map(originalItem => {
+              const item = styleMap[originalItem.Style] || originalItem;
               const sizes = expandSizes(item.Size, item.Style);
               const widths = expandWidths(item.Width);
               const colours = expandColours(item.Colours);
@@ -459,10 +657,13 @@ setTimeout(() => {
                                 return (
                                   <td key={sku}>
                                     <input
-                                      value={quantities[sku] || ""}
-                                      onChange={e => handleChange(sku, e.target.value)}
-                                      style={{ width: 40 }}
-                                    />
+  type="text"
+  inputMode="numeric"
+  pattern="\d*"
+  value={quantities[sku] || ""}
+  onChange={e => handleChange(sku, e.target.value)}
+  style={{ width: 40 }}
+/>
                                   </td>
                                 );
                               })}
