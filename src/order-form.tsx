@@ -295,7 +295,7 @@ const summaryHtml = `
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
   to: email,
-  subject: `Capezio Summer 2026 Order from ${
+  subject: `Capezio Terra Wholesale Order from ${
     customerName && customerId
       ? `${customerName} (${customerId})`
       : customerName || customerId || "Unnamed Customer"
